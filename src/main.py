@@ -1,12 +1,19 @@
 """
-Entry point for the UVC dual-camera preview/capture application on RK3588.
+Entry point for the Nori dual-camera preview/capture application on RK3588.
+
+Two Nori Xvision cameras are driven via the ``norisrc`` GStreamer element
+in hardware-trigger mode.  A single PWM (pwmchip3/pwm0) fans its pulse
+train out to both cameras' trigger inputs so that every frame pair is
+captured synchronously.
 
 Usage:
-    python main.py [--devices auto|/dev/videoX,/dev/videoY] [--no-overlay]
+    python main.py [--device-indices auto|0,1] [--no-overlay] [--trigger-fps N]
 
 Flags:
-    --devices PATHS    Comma-separated camera device paths, or 'auto' (default: auto)
-    --no-overlay       Force appsink-to-QImage fallback (skips VideoOverlay)
+    --device-indices IDS   Comma-separated Nori device indices, or 'auto' (default: auto)
+    --no-overlay           Force appsink-to-QImage fallback (skips VideoOverlay)
+    --trigger-fps N        PWM frequency in Hz for the hardware fsync (default: 27)
+    --pts-filename         Include buffer PTS in captured filenames
 """
 
 import os
@@ -26,7 +33,7 @@ from loguru import logger
 
 from PySide6.QtWidgets import QApplication
 
-from camera_pipeline import find_uvc_cameras, is_rk3588
+from camera_pipeline import scan_nori_cameras, is_rk3588
 from dual_camera_manager import DualCameraManager
 from main_window import MainWindow
 
@@ -41,20 +48,44 @@ def _setup_signals(app: QApplication) -> None:
     signal.signal(signal.SIGTERM, _handler)
 
 
+def _parse_indices(spec: str) -> list[int]:
+    """Parse a '0,1' style string into a list of ints."""
+    out: list[int] = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.append(int(part))
+        except ValueError:
+            raise SystemExit(f"Invalid device index: {part!r}")
+    return out
+
+
 def main():
     Gst.init(None)
     logger.info("GStreamer initialized")
 
-    parser = argparse.ArgumentParser(description="UVC dual-camera preview/capture (RK3588)")
+    if not Gst.ElementFactory.find("norisrc"):
+        logger.error("GStreamer element 'norisrc' not found. Is gst-nori installed?")
+        sys.exit(1)
+
+    parser = argparse.ArgumentParser(description="Nori dual-camera preview/capture (RK3588)")
     parser.add_argument(
-        "--devices",
+        "--device-indices",
         default="auto",
-        help="Comma-separated camera device paths, or 'auto' to detect (default: auto)",
+        help="Comma-separated Nori device indices, or 'auto' to scan (default: auto)",
     )
     parser.add_argument(
         "--no-overlay",
         action="store_true",
         help="Force appsink-to-QImage preview instead of VideoOverlay",
+    )
+    parser.add_argument(
+        "--trigger-fps",
+        type=int,
+        default=27,
+        help="Hardware fsync PWM frequency in Hz (default: 27)",
     )
     parser.add_argument(
         "--pts-filename",
@@ -63,30 +94,36 @@ def main():
     )
     args = parser.parse_args()
 
-    # Resolve device paths
-    if args.devices == "auto":
-        devices = find_uvc_cameras()
-        if not devices:
+    # Resolve device indices
+    if args.device_indices == "auto":
+        indices = scan_nori_cameras()
+        if not indices:
             logger.error(
-                "No UVC cameras found. Connect cameras or use --devices /dev/videoX,/dev/videoY"
+                "No Nori cameras found. Check SDK installation or pass "
+                "--device-indices 0,1 explicitly."
             )
             sys.exit(1)
-        logger.info("Auto-detected {} camera(s): {}", len(devices), devices)
+        logger.info("Auto-detected {} Nori camera(s): {}", len(indices), indices)
     else:
-        devices = [d.strip() for d in args.devices.split(",") if d.strip()]
+        indices = _parse_indices(args.device_indices)
 
     # VideoOverlay is the preferred path on RK3588; on dev machines fall back
     use_overlay = is_rk3588() and not args.no_overlay
     logger.info(
-        "Config | devices={} preview={}",
-        devices,
+        "Config | device-indices={} preview={} trigger-fps={}",
+        indices,
         "VideoOverlay" if use_overlay else "appsink fallback",
+        args.trigger_fps,
     )
 
     app = QApplication(sys.argv)
     _setup_signals(app)
 
-    manager = DualCameraManager(devices=devices, use_overlay=use_overlay)
+    manager = DualCameraManager(
+        device_indices=indices,
+        use_overlay=use_overlay,
+        trigger_fps=args.trigger_fps,
+    )
 
     logger.info("Launching MainWindow")
     window = MainWindow(manager=manager, pts_filename=args.pts_filename)

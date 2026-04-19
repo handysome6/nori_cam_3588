@@ -2,7 +2,9 @@
 DualCameraManager — coordinates two CameraPipeline instances.
 
 Provides unified start/stop lifecycle and simultaneous capture with
-a shared timestamp across both cameras.
+a shared timestamp across both cameras.  Owns the FsyncTrigger that
+drives both cameras via their hardware trigger input; the PWM pulse
+train is started before the pipelines and stopped after them.
 """
 
 import os
@@ -12,6 +14,7 @@ from loguru import logger
 from PySide6.QtCore import QObject, Signal
 
 from camera_pipeline import CameraPipeline, StampedSample
+from fsync_trigger import FsyncTrigger
 
 
 class DualCameraManager(QObject):
@@ -30,17 +33,23 @@ class DualCameraManager(QObject):
 
     def __init__(
         self,
-        devices: list[str],
+        device_indices: list[int],
         use_overlay: bool = True,
         framerate: str = "55/2",
+        trigger_fps: int = 27,
         parent: QObject = None,
     ):
         super().__init__(parent)
-        self._devices = devices[:2]
+        self._device_indices = device_indices[:2]
         self._use_overlay = use_overlay
         self._framerate = framerate
         self._pipelines: list[CameraPipeline | None] = [None, None]
         self._camera_mapping = [0, 1]  # maps canvas position to pipeline index
+
+        # Shared hardware fsync trigger — single PWM pulses both cameras.
+        # Must be started before the pipelines (hardware-trigger cameras
+        # block waiting for the first pulse) and stopped after them.
+        self._fsync = FsyncTrigger(fps=trigger_fps)
 
         self._create_pipelines()
 
@@ -48,22 +57,22 @@ class DualCameraManager(QObject):
         logger.info("DualCameraManager: {}/2 cameras configured", active)
 
     def _create_pipelines(self):
-        """Create CameraPipeline instances for each device."""
+        """Create CameraPipeline instances for each device index."""
         self._pipelines = [None, None]
-        for i, dev in enumerate(self._devices):
+        for i, dev_idx in enumerate(self._device_indices):
             pipe = CameraPipeline(
-                device=dev, use_overlay=self._use_overlay,
+                device_index=dev_idx, use_overlay=self._use_overlay,
                 framerate=self._framerate, parent=self,
             )
             cam_index = i
             pipe.pipeline_error.connect(lambda msg, idx=cam_index: self.camera_error.emit(idx, msg))
             pipe.pipeline_eos.connect(lambda idx=cam_index: self.camera_eos.emit(idx))
             self._pipelines[i] = pipe
-            logger.info("DualCameraManager: cam{} → {} @ {}", i, dev, self._framerate)
+            logger.info("DualCameraManager: cam{} → device-index {} @ {}", i, dev_idx, self._framerate)
 
     def start(self, window_handles: list[int | None]) -> list[bool]:
         """
-        Start both pipelines.
+        Start the fsync PWM and both pipelines.
 
         Args:
             window_handles: [handle_left, handle_right] — native window IDs
@@ -71,6 +80,13 @@ class DualCameraManager(QObject):
         Returns:
             [ok_left, ok_right] — True if pipeline reached PLAYING.
         """
+        # Start fsync PWM *before* pipelines.  In hardware-trigger mode the
+        # Nori SDK blocks in start() waiting for the first trigger pulse,
+        # so without the pulse train the norisrc PAUSED→PLAYING transition
+        # would hang indefinitely.
+        if not self._fsync.running:
+            self._fsync.start()
+
         results = [False, False]
         for canvas_pos in range(2):
             pipe_idx = self._camera_mapping[canvas_pos]
@@ -82,10 +98,11 @@ class DualCameraManager(QObject):
         return results
 
     def stop(self):
-        """Stop both pipelines and release resources."""
+        """Stop both pipelines and the fsync PWM, releasing all resources."""
         for i, pipe in enumerate(self._pipelines):
             if pipe is not None:
                 pipe.stop()
+        self._fsync.stop()
         logger.info("DualCameraManager: all pipelines stopped")
 
     def capture(self, directory: str, pts_in_filename: bool = False) -> list[str | None]:

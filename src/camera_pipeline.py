@@ -1,9 +1,9 @@
 """
-CameraPipeline — GStreamer pipeline for one UVC MJPEG camera on RK3588.
+CameraPipeline — GStreamer pipeline for one Nori SDK camera on RK3588.
 
 Pipeline topology (tee-split):
 
-    v4l2src (MJPEG 5120x3840 @ 27.5 fps, io-mode=mmap)
+    norisrc (MJPEG 5120x3840, trigger-mode=hardware)
       -> tee
          ├─ Preview branch: jpegparse -> mppjpegdec (HW decode + resize) -> preview sink
          └─ Capture branch: queue(leaky) -> appsink (raw MJPEG, latest only)
@@ -17,10 +17,6 @@ Platform selection:
   Dev     — jpegdec + videoconvert + autovideosink (software, test source)
 """
 
-import fcntl
-import glob
-import os
-import struct
 import threading
 import time
 from collections import deque
@@ -37,59 +33,39 @@ from PySide6.QtGui import QImage
 
 
 # ---------------------------------------------------------------------------
-# UVC device auto-detection
+# Nori camera auto-detection
 # ---------------------------------------------------------------------------
 
-# v4l2 ioctl constants (from <linux/videodev2.h>)
-_VIDIOC_QUERYCAP = 0x80685600
-_V4L2_CAP_VIDEO_CAPTURE = 0x00000001
+MAX_PROBE_INDEX = 8  # probe device-index 0..7
 
 
-def _is_capture_device(dev_path: str) -> bool:
-    """Return True if the device supports V4L2 video capture (VIDIOC_QUERYCAP)."""
-    try:
-        with open(dev_path, "rb") as f:
-            buf = b"\x00" * 104  # sizeof(struct v4l2_capability)
-            info = fcntl.ioctl(f, _VIDIOC_QUERYCAP, buf)
-        device_caps = struct.unpack_from("I", info, 88)[0]  # .device_caps field
-        return bool(device_caps & _V4L2_CAP_VIDEO_CAPTURE)
-    except Exception:
-        return False
+def scan_nori_cameras() -> list[int]:
+    """Probe norisrc device indices and return those with a real camera.
 
-
-def find_uvc_cameras() -> list[str]:
+    READY only initialises SDK state — it does not open the device.  We
+    must go to PAUSED (which calls basesrc ``start()`` -> SDK device open)
+    to find out whether a physical camera is actually present.
     """
-    Scan sysfs to find all USB UVC capture devices.
-
-    Criteria:
-      - sysfs path resolves through a 'usb' bus (i.e. it is a USB device)
-      - VIDIOC_QUERYCAP reports V4L2_CAP_VIDEO_CAPTURE
-
-    Returns a list of /dev/videoX paths ordered by device number.
-    """
-    found: list[str] = []
-    candidates = sorted(glob.glob("/sys/class/video4linux/video*"))
-    for video_dir in candidates:
-        try:
-            real = os.path.realpath(video_dir)
-        except OSError:
+    available: list[int] = []
+    for idx in range(MAX_PROBE_INDEX):
+        elem = Gst.ElementFactory.make("norisrc", None)
+        if elem is None:
+            break
+        elem.set_property("device-index", idx)
+        ret = elem.set_state(Gst.State.PAUSED)
+        if ret == Gst.StateChangeReturn.FAILURE:
+            elem.set_state(Gst.State.NULL)
             continue
-        if "usb" not in real.lower():
-            continue
-        dev = "/dev/" + os.path.basename(video_dir)
-        logger.debug("Probing {} (sysfs: {})", dev, real)
-        if _is_capture_device(dev):
-            logger.info("UVC camera found: {}", dev)
-            found.append(dev)
-    if not found:
-        logger.warning("No USB UVC capture device found in /sys/class/video4linux/")
-    return found
-
-
-def find_uvc_camera() -> str | None:
-    """Return the first USB UVC capture device, or None."""
-    devices = find_uvc_cameras()
-    return devices[0] if devices else None
+        # ASYNC means the element is still transitioning — wait for it
+        if ret == Gst.StateChangeReturn.ASYNC:
+            ret, _, _ = elem.get_state(2 * Gst.SECOND)  # 2 s timeout
+        if ret != Gst.StateChangeReturn.FAILURE:
+            available.append(idx)
+            logger.info("Nori camera found: device-index {}", idx)
+        elem.set_state(Gst.State.NULL)
+    if not available:
+        logger.warning("No Nori cameras detected (probed indices 0..{})", MAX_PROBE_INDEX - 1)
+    return available
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +100,7 @@ def _validate_jpeg(data) -> bool:
     return True
 
 
-def _make_jpeg_probe(device: str):
+def _make_jpeg_probe(device_index: int):
     """Create a pad probe callback that drops invalid JPEG buffers."""
     drop_count = 0
 
@@ -141,8 +117,8 @@ def _make_jpeg_probe(device: str):
                 return Gst.PadProbeReturn.OK
             drop_count += 1
             logger.debug(
-                "Dropped corrupted JPEG #{} ({} bytes) on {}",
-                drop_count, buf.get_size(), device,
+                "Dropped corrupted JPEG #{} ({} bytes) on device-index {}",
+                drop_count, buf.get_size(), device_index,
             )
             return Gst.PadProbeReturn.DROP
         finally:
@@ -160,7 +136,7 @@ class StampedSample(NamedTuple):
 
     timestamp_ns is the best available CLOCK_MONOTONIC time for this frame:
       - Preferred: pad-probe wall-clock (time.clock_gettime_ns stamped on
-        v4l2src's streaming thread, before the tee fans out to preview/capture
+        norisrc's streaming thread, before the tee fans out to preview/capture
         branches).  Immune to preview decode contention and independent of
         GStreamer base_time / PTS computation internals.
       - Fallback:  wall-clock at appsink callback time, used only when the
@@ -233,13 +209,13 @@ class CameraPipeline(QObject):
 
     def __init__(
         self,
-        device: str = "/dev/video0",
+        device_index: int = 0,
         use_overlay: bool = True,
         framerate: str = "55/2",
         parent: QObject = None,
     ):
         super().__init__(parent)
-        self._device = device
+        self._device_index = device_index
         self._use_overlay = use_overlay
         self._framerate = framerate
         self._on_rk3588 = is_rk3588()
@@ -257,7 +233,7 @@ class CameraPipeline(QObject):
         self._sample_lock = threading.Lock()
 
         # Pad-probe timestamp side channel: maps buffer PTS → wall-clock ns.
-        # The probe fires on the tee's sink pad (v4l2src streaming thread,
+        # The probe fires on the tee's sink pad (norisrc streaming thread,
         # before preview decode contention).  The appsink callback looks up
         # the probe timestamp by the buffer's PTS to get a jitter-free,
         # base_time-independent CLOCK_MONOTONIC timestamp.
@@ -281,11 +257,13 @@ class CameraPipeline(QObject):
         W, H = self.PREVIEW_W, self.PREVIEW_H
 
         if self._on_rk3588:
-            # RK3588: v4l2src with mmap, mppjpegdec does HW decode + resize.
-            # Framerate must be explicit — RK3588 v4l2src won't auto-negotiate.
+            # RK3588: norisrc with hardware trigger, mppjpegdec does HW decode + resize.
+            # In hardware trigger mode, framerate is driven by the external PWM
+            # signal — omit framerate from caps to let GStreamer negotiate from
+            # the element's advertised modes.
             src = (
-                f"v4l2src device={self._device} io-mode=mmap ! "
-                f"image/jpeg,width=5120,height=3840,framerate={self._framerate} ! "
+                f"norisrc device-index={self._device_index} trigger-mode=hardware ! "
+                f"image/jpeg,width=5120,height=3840 ! "
                 "tee name=t "
             )
             capture_branch = (
@@ -295,7 +273,7 @@ class CameraPipeline(QObject):
             if self._use_overlay:
                 # HW decode + resize -> VideoOverlay sink (xvimagesink)
                 # Preview queue must be leaky to prevent backpressure from
-                # mppjpegdec blocking v4l2src's thread — that would add
+                # mppjpegdec blocking norisrc's thread — that would add
                 # variable jitter to the pad-probe timestamps used for
                 # cross-camera frame matching.
                 preview_branch = (
@@ -362,8 +340,8 @@ class CameraPipeline(QObject):
         """
         self._window_handle = window_handle
         logger.info(
-            "Starting pipeline | device={} overlay={} rk3588={}",
-            self._device, self._use_overlay, self._on_rk3588,
+            "Starting pipeline | device-index={} overlay={} rk3588={}",
+            self._device_index, self._use_overlay, self._on_rk3588,
         )
 
         pipeline_str = self._build_pipeline_string()
@@ -400,12 +378,12 @@ class CameraPipeline(QObject):
             if parser is not None:
                 sink_pad = parser.get_static_pad("sink")
                 sink_pad.add_probe(
-                    Gst.PadProbeType.BUFFER, _make_jpeg_probe(self._device)
+                    Gst.PadProbeType.BUFFER, _make_jpeg_probe(self._device_index)
                 )
-                logger.info("JPEG validation probe attached | device={}", self._device)
+                logger.info("JPEG validation probe attached | device-index={}", self._device_index)
 
         # Attach timestamp probe on tee's sink pad.
-        # This runs on v4l2src's streaming thread (before the tee fans out
+        # This runs on norisrc's streaming thread (before the tee fans out
         # to preview/capture branches), so wall-clock stamps here have
         # sub-ms accuracy with no preview decode contention.
         tee = self._pipeline.get_by_name("t")
@@ -414,7 +392,7 @@ class CameraPipeline(QObject):
             tee_sink_pad.add_probe(
                 Gst.PadProbeType.BUFFER, self._stamp_probe,
             )
-            logger.info("Timestamp probe attached on tee sink pad | device={}", self._device)
+            logger.info("Timestamp probe attached on tee sink pad | device-index={}", self._device_index)
 
         # Connect capture appsink new-sample
         self._capture_sink.connect("new-sample", self._on_new_capture_sample)
@@ -449,7 +427,7 @@ class CameraPipeline(QObject):
         self._state = "playing"
         self._bus_timer.start()
 
-        logger.success("Pipeline playing | device={} overlay={}", self._device, self._use_overlay)
+        logger.success("Pipeline playing | device-index={} overlay={}", self._device_index, self._use_overlay)
         return True
 
     def stop(self):
@@ -462,7 +440,7 @@ class CameraPipeline(QObject):
         """
         if self._state == "stopped" and self._pipeline is None:
             return
-        logger.info("Stopping pipeline | device={}", self._device)
+        logger.info("Stopping pipeline | device-index={}", self._device_index)
         self._bus_timer.stop()
         if self._pipeline is not None:
             self._pipeline.set_state(Gst.State.NULL)
@@ -479,13 +457,13 @@ class CameraPipeline(QObject):
         logger.info("Pipeline stopped")
 
     # ------------------------------------------------------------------
-    # Pad probe — v4l2src streaming thread (before tee fan-out)
+    # Pad probe — norisrc streaming thread (before tee fan-out)
     # ------------------------------------------------------------------
 
     def _stamp_probe(self, pad: Gst.Pad, info: Gst.PadProbeInfo) -> Gst.PadProbeReturn:
         """Record wall-clock timestamp for each buffer, keyed by PTS.
 
-        Runs on v4l2src's streaming thread (the tee's sink pad), before the
+        Runs on norisrc's streaming thread (the tee's sink pad), before the
         buffer is pushed to preview/capture branches.  No preview decode
         contention at this point, so wall-clock accuracy is sub-ms.
         """
@@ -515,7 +493,7 @@ class CameraPipeline(QObject):
             buf = sample.get_buffer()
             pts = buf.pts
             ts = None
-            # Look up the probe timestamp (stamped on v4l2src's thread,
+            # Look up the probe timestamp (stamped on norisrc's thread,
             # before decode contention, no base_time dependency).
             if pts != Gst.CLOCK_TIME_NONE:
                 with self._probe_lock:
@@ -651,7 +629,7 @@ class CameraPipeline(QObject):
 
         Each entry is a StampedSample(timestamp_ns, sample) where timestamp_ns
         is the pad-probe wall-clock CLOCK_MONOTONIC timestamp (stamped on
-        v4l2src's streaming thread before the tee), or a wall-clock fallback
+        norisrc's streaming thread before the tee), or a wall-clock fallback
         at appsink time if the probe lookup failed.  DualCameraManager uses
         these timestamps to match frames across cameras — same-trigger frames
         have probe timestamps within ~1 ms.

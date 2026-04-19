@@ -19,6 +19,35 @@ sudo apt update && sudo apt install libxcb-cursor0
 
 GStreamer 1.20+ with Rockchip MPP plugins (`mppjpegdec`) and PyGObject (`gi`) must be available system-wide.
 
+### Prerequisites (required for dual camera streaming)
+
+The current version depends on the `norisrc` GStreamer element and PWM-based hardware trigger. Both must be set up before running the application.
+
+#### 1. Install `gst-nori` (provides `norisrc`)
+
+`norisrc` is a custom GStreamer source element for the Nori camera pipeline. Download the latest `.deb` release and install it following the release notes:
+
+- Repository: https://github.com/handysome6/gst-nori
+- Grab the latest `.deb` from the Releases page and install per the release notes (typically `sudo dpkg -i gst-nori_*.deb`).
+
+Verify the plugin is visible to GStreamer:
+
+```bash
+gst-inspect-1.0 norisrc
+```
+
+#### 2. Configure PWM for the hardware fsync trigger
+
+The cameras share a TRG/GND fsync line driven by an RK3588 PWM channel. A setup script installs a udev rule and systemd oneshot service so the PWM sysfs attributes are writable by non-root users:
+
+```bash
+sudo ./scirpts/setup_pwm.sh                          # RK3588 default (pwmchip3 / pwm0)
+sudo ./scirpts/setup_pwm.sh --chip pwmchip0 --channel 1   # different board layout
+sudo ./scirpts/setup_pwm.sh --uninstall              # remove udev rule + service
+```
+
+Must be run with `sudo` — it writes to `/etc/udev/rules.d/` and `/etc/systemd/system/`. Without this, the application cannot drive the GPIO/PWM trigger and neither camera will produce frames.
+
 ### UV (recommended)
 
 ```bash

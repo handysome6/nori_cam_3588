@@ -112,8 +112,10 @@ def build_pipeline_desc(
     sensor_gain: Optional[int] = None,
 ) -> str:
     """Build a GStreamer pipeline string for norisrc on RK3588."""
-    # Source element with optional SDK / camera-control properties
-    src_parts = [f"norisrc device-index={device_index}"]
+    # Source element.  auto-exposure=true drives both AE and auto-gain on
+    # this UVC sensor (V4L2_CID_EXPOSURE_AUTO).  Manual sensor-shutter /
+    # sensor-gain values override it, so only append them when requested.
+    src_parts = [f"norisrc device-index={device_index}", "auto-exposure=true"]
     if trigger_mode is not None:
         src_parts.append(f"trigger-mode={trigger_mode}")
     if sensor_shutter is not None:

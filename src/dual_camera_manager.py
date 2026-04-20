@@ -4,17 +4,26 @@ DualCameraManager — coordinates two CameraPipeline instances.
 Provides unified start/stop lifecycle and simultaneous capture with
 a shared timestamp across both cameras.  Owns the FsyncTrigger that
 drives both cameras via their hardware trigger input; the PWM pulse
-train is started before the pipelines and stopped after them.
+train is started on a short delay after both pipelines are PLAYING
+(so both cameras are waiting for the first pulse together) and
+stopped after the pipelines on teardown.
 """
 
 import os
 from datetime import datetime
 
 from loguru import logger
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, QTimer, Signal
 
 from camera_pipeline import CameraPipeline, StampedSample
 from fsync_trigger import FsyncTrigger
+
+
+# Delay between pipelines reaching PLAYING and the first PWM pulse.
+# Both cameras must be in "waiting for trigger" state before any pulse
+# arrives — otherwise one camera occasionally misses the initial pulses
+# and stays black until the trigger wire is physically interrupted.
+FSYNC_START_DELAY_MS = 2500
 
 
 class DualCameraManager(QObject):
@@ -47,9 +56,12 @@ class DualCameraManager(QObject):
         self._camera_mapping = [0, 1]  # maps canvas position to pipeline index
 
         # Shared hardware fsync trigger — single PWM pulses both cameras.
-        # Must be started before the pipelines (hardware-trigger cameras
-        # block waiting for the first pulse) and stopped after them.
+        # Started on a delay *after* both pipelines are PLAYING (see
+        # FSYNC_START_DELAY_MS) and stopped after the pipelines on teardown.
         self._fsync = FsyncTrigger(fps=trigger_fps)
+        self._fsync_start_timer = QTimer(self)
+        self._fsync_start_timer.setSingleShot(True)
+        self._fsync_start_timer.timeout.connect(self._start_fsync)
 
         self._create_pipelines()
 
@@ -72,7 +84,7 @@ class DualCameraManager(QObject):
 
     def start(self, window_handles: list[int | None]) -> list[bool]:
         """
-        Start the fsync PWM and both pipelines.
+        Start both pipelines, then the fsync PWM after a short delay.
 
         Args:
             window_handles: [handle_left, handle_right] — native window IDs
@@ -80,13 +92,6 @@ class DualCameraManager(QObject):
         Returns:
             [ok_left, ok_right] — True if pipeline reached PLAYING.
         """
-        # Start fsync PWM *before* pipelines.  In hardware-trigger mode the
-        # Nori SDK blocks in start() waiting for the first trigger pulse,
-        # so without the pulse train the norisrc PAUSED→PLAYING transition
-        # would hang indefinitely.
-        if not self._fsync.running:
-            self._fsync.start()
-
         results = [False, False]
         for canvas_pos in range(2):
             pipe_idx = self._camera_mapping[canvas_pos]
@@ -95,10 +100,26 @@ class DualCameraManager(QObject):
                 continue
             handle = window_handles[canvas_pos] if canvas_pos < len(window_handles) else None
             results[canvas_pos] = pipe.start(window_handle=handle)
+
+        # Defer PWM so both cameras are armed and waiting for trigger pulses
+        # when the first pulse arrives.  Firing too early lets one camera
+        # miss the initial pulses and stay black.
+        if not self._fsync.running:
+            self._fsync_start_timer.start(FSYNC_START_DELAY_MS)
+            logger.info(
+                "FSYNC scheduled to start in {} ms (after pipelines PLAYING)",
+                FSYNC_START_DELAY_MS,
+            )
         return results
+
+    def _start_fsync(self):
+        """Timer callback: start the PWM pulse train."""
+        if not self._fsync.running:
+            self._fsync.start()
 
     def stop(self):
         """Stop both pipelines and the fsync PWM, releasing all resources."""
+        self._fsync_start_timer.stop()
         for i, pipe in enumerate(self._pipelines):
             if pipe is not None:
                 pipe.stop()

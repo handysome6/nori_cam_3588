@@ -33,7 +33,7 @@ from loguru import logger
 
 from PySide6.QtWidgets import QApplication
 
-from camera_pipeline import scan_nori_cameras, is_rk3588
+from camera_pipeline import detect_nori_cameras, is_rk3588
 from dual_camera_manager import DualCameraManager
 from main_window import MainWindow
 
@@ -96,14 +96,27 @@ def main():
 
     # Resolve device indices
     if args.device_indices == "auto":
-        indices = scan_nori_cameras()
-        if not indices:
+        cameras = detect_nori_cameras()
+        if not cameras:
             logger.error(
                 "No Nori cameras found. Check SDK installation or pass "
                 "--device-indices 0,1 explicitly."
             )
             sys.exit(1)
-        logger.info("Auto-detected {} Nori camera(s): {}", len(indices), indices)
+        for c in cameras:
+            logger.info(
+                "  idx={} tag={} product='{}' loc={}",
+                c.index, c.tag or "(untagged)", c.product, c.location,
+            )
+        untagged = [c for c in cameras if not c.tag]
+        if untagged:
+            logger.warning(
+                "{} camera(s) are untagged — LEFT/RIGHT mapping falls back to "
+                "USB enumeration order and may vary across reboots. "
+                "Assign tags with `nori-ctl tag set <idx> LEFT|RIGHT`.",
+                len(untagged),
+            )
+        indices = [c.index for c in cameras]
     else:
         indices = _parse_indices(args.device_indices)
 

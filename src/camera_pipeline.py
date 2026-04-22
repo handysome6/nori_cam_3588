@@ -17,6 +17,8 @@ Platform selection:
   Dev     — jpegdec + videoconvert + autovideosink (software, test source)
 """
 
+import shutil
+import subprocess
 import threading
 import time
 from collections import deque
@@ -38,9 +40,73 @@ from PySide6.QtGui import QImage
 
 MAX_PROBE_INDEX = 8  # probe device-index 0..7
 
+_NORI_CTL_COLUMNS = ("#", "VID:PID", "Product", "Serial", "Bus:Dev", "Location", "Tag")
 
-def scan_nori_cameras() -> list[int]:
-    """Probe norisrc device indices and return those with a real camera.
+
+class NoriCamera(NamedTuple):
+    """A detected Nori camera.  Empty strings are used for unknown fields
+    (e.g. the probe-fallback path knows the index but nothing else)."""
+    index: int
+    tag: str
+    product: str
+    location: str
+
+
+def _list_nori_cameras_via_ctl() -> list[NoriCamera]:
+    """Run ``nori-ctl list`` and parse rows.
+
+    Raises ``FileNotFoundError`` if ``nori-ctl`` is not on PATH, or
+    ``RuntimeError`` if the command fails or output is unparseable.
+    """
+    exe = shutil.which("nori-ctl")
+    if exe is None:
+        raise FileNotFoundError("nori-ctl")
+
+    result = subprocess.run(
+        [exe, "list"], capture_output=True, text=True, check=False, timeout=5,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"'nori-ctl list' exited {result.returncode}: "
+            f"{(result.stderr or result.stdout).strip()}"
+        )
+
+    lines = [ln for ln in result.stdout.splitlines() if ln.strip()]
+    if not lines:
+        return []
+
+    header = lines[0]
+    positions: list[int] = []
+    for col in _NORI_CTL_COLUMNS:
+        pos = header.find(col)
+        if pos < 0:
+            raise RuntimeError(
+                f"Unexpected 'nori-ctl list' format: missing column '{col}'"
+            )
+        positions.append(pos)
+
+    def field(line: str, i: int) -> str:
+        start = positions[i]
+        end = positions[i + 1] if i + 1 < len(positions) else None
+        return (line[start:end] if end is not None else line[start:]).strip()
+
+    cameras: list[NoriCamera] = []
+    for line in lines[1:]:
+        try:
+            idx = int(field(line, 0))
+        except ValueError:
+            continue
+        cameras.append(NoriCamera(
+            index=idx,
+            tag=field(line, _NORI_CTL_COLUMNS.index("Tag")),
+            product=field(line, _NORI_CTL_COLUMNS.index("Product")),
+            location=field(line, _NORI_CTL_COLUMNS.index("Location")),
+        ))
+    return cameras
+
+
+def _probe_nori_cameras() -> list[int]:
+    """Fallback: probe norisrc device indices by pushing to PAUSED.
 
     READY only initialises SDK state — it does not open the device.  We
     must go to PAUSED (which calls basesrc ``start()`` -> SDK device open)
@@ -56,16 +122,49 @@ def scan_nori_cameras() -> list[int]:
         if ret == Gst.StateChangeReturn.FAILURE:
             elem.set_state(Gst.State.NULL)
             continue
-        # ASYNC means the element is still transitioning — wait for it
         if ret == Gst.StateChangeReturn.ASYNC:
-            ret, _, _ = elem.get_state(2 * Gst.SECOND)  # 2 s timeout
+            ret, _, _ = elem.get_state(2 * Gst.SECOND)
         if ret != Gst.StateChangeReturn.FAILURE:
             available.append(idx)
             logger.info("Nori camera found: device-index {}", idx)
         elem.set_state(Gst.State.NULL)
-    if not available:
-        logger.warning("No Nori cameras detected (probed indices 0..{})", MAX_PROBE_INDEX - 1)
     return available
+
+
+def detect_nori_cameras() -> list[NoriCamera]:
+    """Detect Nori cameras, preferring ``nori-ctl list`` over index probing.
+
+    Falls back to probing when ``nori-ctl`` is missing or fails; in that
+    case a warning is logged and ``tag``/``product``/``location`` are
+    empty strings.  Cameras that exist but have no tag yet are returned
+    normally with ``tag=""`` — callers decide how to handle them.
+    """
+    try:
+        cameras = _list_nori_cameras_via_ctl()
+        logger.info("Detected {} Nori camera(s) via nori-ctl", len(cameras))
+        return cameras
+    except FileNotFoundError:
+        logger.warning(
+            "'nori-ctl' not on PATH; falling back to GStreamer probe "
+            "(no tag/location info, slower)"
+        )
+    except Exception as e:
+        logger.warning(
+            "'nori-ctl list' failed ({}); falling back to GStreamer probe", e
+        )
+
+    indices = _probe_nori_cameras()
+    if not indices:
+        logger.warning("No Nori cameras detected (probed indices 0..{})", MAX_PROBE_INDEX - 1)
+    return [NoriCamera(index=i, tag="", product="", location="") for i in indices]
+
+
+def scan_nori_cameras() -> list[int]:
+    """Return available Nori device indices (thin wrapper for legacy callers).
+
+    Prefer :func:`detect_nori_cameras` when tag/location info is useful.
+    """
+    return [c.index for c in detect_nori_cameras()]
 
 
 # ---------------------------------------------------------------------------

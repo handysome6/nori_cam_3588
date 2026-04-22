@@ -197,9 +197,14 @@ class CameraPipeline(QObject):
     pipeline_eos = Signal()
     preview_frame = Signal(QImage)
 
-    # Preview dimensions for both modes
-    PREVIEW_W = 1280
+    # Capture resolution (Nori 20MP sensor native mode)
+    CAPTURE_W = 5120
+    CAPTURE_H = 3840
+
+    # Preview dimensions — 720 vertical, width derived from capture aspect
+    # ratio so the 4:3 source isn't stretched into a 16:9 preview.
     PREVIEW_H = 720
+    PREVIEW_W = (CAPTURE_W * PREVIEW_H // CAPTURE_H + 1) & ~1  # round up to even
 
     # Framerate presets: label -> GStreamer fraction string
     FRAMERATE_PRESETS = {
@@ -263,7 +268,7 @@ class CameraPipeline(QObject):
             # the element's advertised modes.
             src = (
                 f"norisrc device-index={self._device_index} trigger-mode=hardware ! "
-                f"image/jpeg,width=5120,height=3840 ! "
+                f"image/jpeg,width={self.CAPTURE_W},height={self.CAPTURE_H} ! "
                 "tee name=t "
             )
             capture_branch = (

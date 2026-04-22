@@ -24,7 +24,7 @@ import gi
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst  # noqa: E402
 
-from gst_common import PREVIEW_WIDTH, PREVIEW_HEIGHT, run_preview  # noqa: E402
+from gst_common import preview_dims_for, run_preview  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -215,12 +215,13 @@ def build_pipeline_desc(device: str, mode: CaptureMode, sink: str) -> str:
     downscale inside the decoder, eliminating the need for a separate videoscale
     or nvvidconv element.
     """
+    preview_w, preview_h = preview_dims_for(mode.width, mode.height)
     return (
         f"v4l2src device={device} io-mode=mmap "
         f"! image/jpeg,width={mode.width},height={mode.height},"
         f"framerate={mode.gst_framerate} "
         f"! jpegparse name=parser "
-        f"! mppjpegdec width={PREVIEW_WIDTH} height={PREVIEW_HEIGHT} format=NV12 "
+        f"! mppjpegdec width={preview_w} height={preview_h} format=NV12 "
         f"! {sink} sync=false"
     )
 

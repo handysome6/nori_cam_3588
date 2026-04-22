@@ -20,7 +20,7 @@ import gi
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst  # noqa: E402
 
-from gst_common import PREVIEW_WIDTH, PREVIEW_HEIGHT, run_preview  # noqa: E402
+from gst_common import preview_dims_for, run_preview  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Default capture mode — Nori Xvision 20MP sensor
@@ -184,11 +184,13 @@ def build_pipeline_desc(
         limited = fps.limit_denominator(1000)
         caps += f",framerate={limited.numerator}/{limited.denominator}"
 
+    preview_w, preview_h = preview_dims_for(width, height)
+
     return (
         f"{src} "
         f"! {caps} "
         f"! jpegparse name=parser "
-        f"! mppjpegdec width={PREVIEW_WIDTH} height={PREVIEW_HEIGHT} format=NV12 "
+        f"! mppjpegdec width={preview_w} height={preview_h} format=NV12 "
         f"! {sink} sync=false"
     )
 

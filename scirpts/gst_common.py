@@ -12,10 +12,27 @@ gi.require_version("Gst", "1.0")
 from gi.repository import GLib, Gst  # noqa: E402
 
 # ---------------------------------------------------------------------------
-# Preview resolution — mppjpegdec does HW downscale in the decoder itself
+# Preview resolution — mppjpegdec does HW downscale in the decoder itself.
+# Height is fixed at 720; width is derived from capture aspect ratio via
+# preview_dims_for() so a 5120x3840 (4:3) source previews as 960x720, not a
+# stretched 1280x720 (16:9).
 # ---------------------------------------------------------------------------
-PREVIEW_WIDTH = 1280
 PREVIEW_HEIGHT = 720
+
+
+def preview_dims_for(capture_width: int, capture_height: int,
+                     preview_height: int = PREVIEW_HEIGHT) -> tuple[int, int]:
+    """Return (w, h) preview dims matching the capture aspect ratio.
+
+    Width is rounded to the nearest even integer (mppjpegdec and most YUV
+    sinks reject odd widths).
+    """
+    if capture_height <= 0 or capture_width <= 0:
+        raise ValueError("capture dimensions must be positive")
+    width = round(capture_width * preview_height / capture_height)
+    if width % 2:
+        width += 1
+    return width, preview_height
 
 
 def validate_jpeg(

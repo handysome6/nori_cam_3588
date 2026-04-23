@@ -15,6 +15,7 @@ from datetime import datetime
 from loguru import logger
 from PySide6.QtCore import QObject, QTimer, Signal
 
+from camera_config import CameraSettings
 from camera_pipeline import CameraPipeline, StampedSample
 from fsync_trigger import FsyncTrigger
 
@@ -46,12 +47,20 @@ class DualCameraManager(QObject):
         use_overlay: bool = True,
         framerate: str = "55/2",
         trigger_fps: int = 27,
+        camera_settings: list[CameraSettings] | None = None,
         parent: QObject = None,
     ):
         super().__init__(parent)
         self._device_indices = device_indices[:2]
         self._use_overlay = use_overlay
         self._framerate = framerate
+        # Per-pipeline settings indexed the same way as _device_indices.
+        # None means "use CameraSettings defaults" (dev machine / no config).
+        self._camera_settings: list[CameraSettings | None] = (
+            list(camera_settings[:2]) if camera_settings else [None, None]
+        )
+        while len(self._camera_settings) < 2:
+            self._camera_settings.append(None)
         self._pipelines: list[CameraPipeline | None] = [None, None]
         self._camera_mapping = [0, 1]  # maps canvas position to pipeline index
 
@@ -74,13 +83,18 @@ class DualCameraManager(QObject):
         for i, dev_idx in enumerate(self._device_indices):
             pipe = CameraPipeline(
                 device_index=dev_idx, use_overlay=self._use_overlay,
-                framerate=self._framerate, parent=self,
+                framerate=self._framerate, settings=self._camera_settings[i],
+                parent=self,
             )
             cam_index = i
             pipe.pipeline_error.connect(lambda msg, idx=cam_index: self.camera_error.emit(idx, msg))
             pipe.pipeline_eos.connect(lambda idx=cam_index: self.camera_eos.emit(idx))
             self._pipelines[i] = pipe
-            logger.info("DualCameraManager: cam{} → device-index {} @ {}", i, dev_idx, self._framerate)
+            role = self._camera_settings[i].role if self._camera_settings[i] else "?"
+            logger.info(
+                "DualCameraManager: cam{} → device-index {} role={} @ {}",
+                i, dev_idx, role, self._framerate,
+            )
 
     def start(self, window_handles: list[int | None]) -> list[bool]:
         """

@@ -40,5 +40,8 @@ captures/
 # Logs
 *.log
 
+# Per-setup camera tuning overrides (never committed)
+camera_config.local.yaml
+
 # Claude Code
 .ccs/

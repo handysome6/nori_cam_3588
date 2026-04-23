@@ -33,6 +33,8 @@ from loguru import logger
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Signal, Slot
 from PySide6.QtGui import QImage
 
+from camera_config import CameraSettings
+
 
 # ---------------------------------------------------------------------------
 # Nori camera auto-detection
@@ -316,12 +318,14 @@ class CameraPipeline(QObject):
         device_index: int = 0,
         use_overlay: bool = True,
         framerate: str = "55/2",
+        settings: CameraSettings | None = None,
         parent: QObject = None,
     ):
         super().__init__(parent)
         self._device_index = device_index
         self._use_overlay = use_overlay
         self._framerate = framerate
+        self._settings = settings if settings is not None else CameraSettings(role="")
         self._on_rk3588 = is_rk3588()
 
         # Runtime state
@@ -357,6 +361,25 @@ class CameraPipeline(QObject):
     # Pipeline string construction
     # ------------------------------------------------------------------
 
+    def _norisrc_settings_props(self) -> str:
+        """Format user-configurable norisrc properties as launch-line tokens.
+
+        `sensor-shutter` / `sensor-gain` are only emitted when auto-exposure
+        is off — norisrc logs a warning if they're set while AE is on, and
+        AE=false resets the UVC exposure/gain registers to defaults before
+        applying these values.
+        """
+        s = self._settings
+        parts = [
+            f"auto-exposure={'true' if s.auto_exposure else 'false'}",
+            f"auto-white-balance={'true' if s.auto_white_balance else 'false'}",
+            f"mirror-flip={s.mirror_flip}",
+        ]
+        if not s.auto_exposure:
+            parts.append(f"sensor-shutter={s.sensor_shutter}")
+            parts.append(f"sensor-gain={s.sensor_gain}")
+        return " ".join(parts)
+
     def _build_pipeline_string(self) -> str:
         W, H = self.PREVIEW_W, self.PREVIEW_H
 
@@ -366,7 +389,8 @@ class CameraPipeline(QObject):
             # signal — omit framerate from caps to let GStreamer negotiate from
             # the element's advertised modes.
             src = (
-                f"norisrc device-index={self._device_index} trigger-mode=hardware ! "
+                f"norisrc device-index={self._device_index} trigger-mode=hardware "
+                f"{self._norisrc_settings_props()} ! "
                 f"image/jpeg,width={self.CAPTURE_W},height={self.CAPTURE_H} ! "
                 "tee name=t "
             )

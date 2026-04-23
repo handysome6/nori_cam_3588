@@ -20,6 +20,7 @@ import os
 import signal
 import sys
 import argparse
+from pathlib import Path
 
 # Force Qt to use X11 (xcb) backend — xvimagesink requires X11 window IDs,
 # which are unavailable under the native Wayland Qt backend.
@@ -33,9 +34,35 @@ from loguru import logger
 
 from PySide6.QtWidgets import QApplication
 
+from camera_config import CameraConfig, CameraSettings, load_camera_config
 from camera_pipeline import detect_nori_cameras, is_rk3588
 from dual_camera_manager import DualCameraManager
 from main_window import MainWindow
+
+
+SRC_DIR = Path(__file__).resolve().parent
+DEFAULT_CONFIG = SRC_DIR / "camera_config.yaml"
+DEFAULT_LOCAL_CONFIG = SRC_DIR / "camera_config.local.yaml"
+
+
+def _resolve_indices_by_role(
+    cameras, left_role: str, right_role: str,
+) -> list[int] | None:
+    """Return [left_idx, right_idx] matched by nori-ctl tag, or None if not resolvable.
+
+    Falls back to None (caller uses enumeration order) when either role
+    isn't found or matches nothing — mis-matching would silently assign
+    the wrong physical camera to each slot.
+    """
+    by_tag: dict[str, int] = {}
+    for c in cameras:
+        if c.tag:
+            by_tag.setdefault(c.tag, c.index)
+    left_idx = by_tag.get(left_role)
+    right_idx = by_tag.get(right_role)
+    if left_idx is None or right_idx is None or left_idx == right_idx:
+        return None
+    return [left_idx, right_idx]
 
 
 def _setup_signals(app: QApplication) -> None:
@@ -92,9 +119,24 @@ def main():
         action="store_true",
         help="Include GStreamer buffer PTS in captured filenames for sync debugging",
     )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=DEFAULT_CONFIG,
+        help=f"Path to base camera config YAML (default: {DEFAULT_CONFIG.name})",
+    )
+    parser.add_argument(
+        "--local-config",
+        type=Path,
+        default=DEFAULT_LOCAL_CONFIG,
+        help=f"Path to local override YAML, optional (default: {DEFAULT_LOCAL_CONFIG.name})",
+    )
     args = parser.parse_args()
 
-    # Resolve device indices
+    cfg: CameraConfig = load_camera_config(args.config, args.local_config)
+
+    # Resolve device indices.  Prefer config-driven role→tag matching; fall
+    # back to USB enumeration order when tags are missing.
     if args.device_indices == "auto":
         cameras = detect_nori_cameras()
         if not cameras:
@@ -108,17 +150,27 @@ def main():
                 "  idx={} tag={} product='{}' loc={}",
                 c.index, c.tag or "(untagged)", c.product, c.location,
             )
-        untagged = [c for c in cameras if not c.tag]
-        if untagged:
-            logger.warning(
-                "{} camera(s) are untagged — LEFT/RIGHT mapping falls back to "
-                "USB enumeration order and may vary across reboots. "
-                "Assign tags with `nori-ctl tag set <idx> LEFT|RIGHT`.",
-                len(untagged),
+        resolved = _resolve_indices_by_role(cameras, cfg.left.role, cfg.right.role)
+        if resolved is not None:
+            indices = resolved
+            logger.info(
+                "Camera mapping by role: left={}→idx{} right={}→idx{}",
+                cfg.left.role, indices[0], cfg.right.role, indices[1],
             )
-        indices = [c.index for c in cameras]
+        else:
+            indices = [c.index for c in cameras][:2]
+            logger.warning(
+                "Could not resolve both roles ({}/{}) from camera tags — "
+                "falling back to USB enumeration order {}. "
+                "Assign tags with `nori-ctl tag set <idx> LEFT|RIGHT`.",
+                cfg.left.role, cfg.right.role, indices,
+            )
     else:
         indices = _parse_indices(args.device_indices)
+        logger.info(
+            "Explicit --device-indices override: {} (left={}, right={})",
+            indices, cfg.left.role, cfg.right.role,
+        )
 
     # VideoOverlay is the preferred path on RK3588; on dev machines fall back
     use_overlay = is_rk3588() and not args.no_overlay
@@ -136,6 +188,7 @@ def main():
         device_indices=indices,
         use_overlay=use_overlay,
         trigger_fps=args.trigger_fps,
+        camera_settings=[cfg.left, cfg.right],
     )
 
     logger.info("Launching MainWindow")

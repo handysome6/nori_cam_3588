@@ -1,0 +1,23 @@
+# Camera defaults committed to the repo.
+# Per-setup tuning lives in `camera_config.local.yaml` (gitignored) and
+# is deep-merged on top of this file at startup.  Only include the keys
+# you want to override in the local file; everything else inherits here.
+#
+# Knobs map 1:1 to norisrc properties (underscore <-> dash).
+# See `gst-inspect-1.0 norisrc` for the source of truth.
+
+left:
+  role: LEFT              # nori-ctl tag; see `nori-ctl list` / `nori-ctl tag set`
+  auto_exposure: true     # false resets UVC exposure/gain to defaults, then applies sensor_* below
+  auto_white_balance: false
+  sensor_shutter: 5000    # microseconds; used only when auto_exposure=false
+  sensor_gain: 1          # analog gain multiplier; used only when auto_exposure=false
+  mirror_flip: normal     # normal | mirror | flip | mirror-flip
+
+right:
+  role: RIGHT
+  auto_exposure: true
+  auto_white_balance: false
+  sensor_shutter: 5000
+  sensor_gain: 1
+  mirror_flip: mirror-flip

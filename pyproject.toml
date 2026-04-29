@@ -5,6 +5,9 @@ description = "Dual UVC camera preview and capture on RK3588"
 requires-python = ">=3.10"
 dependencies = [
     "loguru>=0.7.3",
+    "numpy>=1.24",
     "omegaconf>=2.3.0",
+    "opencv-python>=4.8",
+    "pyserial>=3.5",
     "pyside6==6.8.0.2",
 ]

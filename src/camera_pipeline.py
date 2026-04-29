@@ -10,7 +10,8 @@ Pipeline topology (tee-split):
 
 Two preview modes controlled by `use_overlay`:
   True  — VideoOverlay: GStreamer renders directly into a Qt widget window handle
-  False — appsink fallback: decoded RGB frames are emitted as QImage via signal
+  False — appsink fallback: decoded NV12 (RK3588) / RGB (dev) frames are
+          converted via cv2 / direct wrap and emitted as QImage via signal
 
 Platform selection:
   RK3588  — mppjpegdec + xvimagesink (HW accelerated, built-in resize)
@@ -411,12 +412,16 @@ class CameraPipeline(QObject):
                     "xvimagesink name=preview_sink sync=false "
                 )
             else:
-                # HW decode + resize -> RGB -> appsink (CPU copy for QImage)
+                # HW decode + resize -> NV12 -> appsink.  Inserting
+                # `videoconvert ! video/x-raw,format=RGB` here triggers a
+                # `not-negotiated` failure: mppjpegdec only outputs NV12 (or
+                # RK-tiled equivalents) and refuses the RGB caps filter.  Push
+                # raw NV12 into the appsink and convert to BGR with cv2 in
+                # `_on_new_preview_sample` instead.
                 preview_branch = (
                     f"t. ! queue leaky=downstream max-size-buffers=2 ! "
                     f"jpegparse name=parser ! "
-                    f"mppjpegdec width={W} height={H} ! "
-                    f"videoconvert ! video/x-raw,format=RGB,width={W},height={H} ! "
+                    f"mppjpegdec width={W} height={H} format=NV12 ! "
                     "appsink name=preview_sink drop=true max-buffers=1 "
                     "emit-signals=true sync=false "
                 )
@@ -638,7 +643,16 @@ class CameraPipeline(QObject):
     # ------------------------------------------------------------------
 
     def _on_new_preview_sample(self, appsink: Gst.Element) -> Gst.FlowReturn:
-        """Pull decoded RGB frame, convert to QImage, emit signal."""
+        """Pull decoded preview frame, wrap in QImage, emit signal.
+
+        Two formats are supported:
+          - NV12 (RK3588 path): mppjpegdec outputs NV12 directly because
+            attempting `videoconvert ! video/x-raw,format=RGB` after it
+            triggers a not-negotiated stream error.  Convert NV12 → BGR
+            with cv2 here and wrap in a Format_BGR888 QImage.
+          - RGB  (dev path): jpegdec → videoconvert produces packed RGB,
+            wrap directly in a Format_RGB888 QImage.
+        """
         sample = appsink.emit("pull-sample")
         if sample is None:
             return Gst.FlowReturn.OK
@@ -647,20 +661,39 @@ class CameraPipeline(QObject):
         structure = caps.get_structure(0)
         width = structure.get_value("width")
         height = structure.get_value("height")
+        fmt = structure.get_value("format")
 
         buf = sample.get_buffer()
         result, map_info = buf.map(Gst.MapFlags.READ)
         if not result:
             return Gst.FlowReturn.OK
         try:
-            # Make a copy so the QImage owns the bytes after buf.unmap()
-            image = QImage(
-                bytes(map_info.data),
-                width,
-                height,
-                width * 3,
-                QImage.Format.Format_RGB888,
-            ).copy()
+            if fmt == "NV12":
+                import cv2
+                import numpy as np
+                # NV12: Y plane (H×W) followed by interleaved UV (H/2 × W).
+                # Total = W × H × 3/2 bytes.
+                yuv = np.frombuffer(map_info.data, dtype=np.uint8).reshape(
+                    height * 3 // 2, width
+                )
+                bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_NV12)
+                # bgr.tobytes() detaches from the GStreamer-owned buffer so
+                # the QImage stays valid after buf.unmap().
+                image = QImage(
+                    bgr.tobytes(),
+                    width,
+                    height,
+                    width * 3,
+                    QImage.Format.Format_BGR888,
+                )
+            else:
+                image = QImage(
+                    bytes(map_info.data),
+                    width,
+                    height,
+                    width * 3,
+                    QImage.Format.Format_RGB888,
+                ).copy()
         finally:
             buf.unmap(map_info)
 

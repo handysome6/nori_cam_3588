@@ -163,7 +163,7 @@ class DualCameraManager(QObject):
         os.makedirs(directory, exist_ok=True)
         ts = datetime.now()
         ms = ts.microsecond // 1000
-        ts_str = ts.strftime("%Y%m%d_%H%M%S_") + f"{ms:03d}"
+        ts_str = ts.strftime("%Y%m%d%H%M%S") + f"{ms:03d}"
 
         # Phase 1: snapshot ring buffers from both cameras
         pipes: list[CameraPipeline | None] = [None, None]
